@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  VoiceClient.swift
 //  VoiceSDK
 //
 //  Created by Yurii Zhuk on 24.06.2025.
@@ -17,42 +17,45 @@ public protocol VoiceClient {
     /// The currently active call, if any.
     var activeCall: Call? { get }
 
-    
-    /// Assigns the user identity to the client.
-    ///
-    /// - Parameter user: A `User` object representing the identity
-    ///   used for outgoing calls.
-    func setUser(_ user: User)
+    /// All calls that haven't ended yet, in no particular order. Holds more than one
+    /// call only while an incoming call is waiting: answering it puts the other call
+    /// on hold, and `Call.hold(false)` on the held call swaps them back.
+    var calls: [Call] { get }
 
     
-    /// Assigns a JWT authentication token to the client.
-    ///
-    /// The token is stored internally and used when creating new calls.
-    ///
-    /// - Parameter token: A valid JWT string.
-    func setJWT(_ token: String)
-    
-    
-    /// Creates and starts a new audio call using the previously configured
-    /// user or JWT.
-    ///
-    /// - Parameter listener: A `CallListener` to receive call events
-    ///   (e.g. ringing, connected, ended).
-    /// - Returns: A `Call` instance representing the ongoing call.
-    func makeAudioCall(listener: CallListener) -> Call
-
-    
-    /// Creates and starts a new audio call with a specific JWT.
-    ///
-    /// This overload allows overriding the stored token for a single call.
+    /// Creates and starts a new call using the configured authentication method.
     ///
     /// - Parameters:
-    ///   - jwt: A JWT string to be used for this call only.
-    ///   - listener: A `CallListener` to receive call events.
+    ///   - options: Call configuration, including its media type.
+    ///   - observer: A `CallObserver` that receives call events
+    ///     (e.g. ringing, connected, ended).
     /// - Returns: A `Call` instance representing the ongoing call.
-    func makeAudioCall(jwt: String, listener: CallListener) -> Call
-    
-    
+    func makeCall(options: CallOptions, observer: CallObserver) -> Call
+
+
+    /// Handles an incoming call VoIP push and returns the incoming call immediately.
+    ///
+    /// The returned call starts in `.ringing` state with `id == push.callId`.
+    /// In the background the SDK fetches the SIP configuration, registers the SIP
+    /// account and notifies the server that the client is ready to receive the call.
+    /// Once the SIP INVITE arrives the call can be answered with `Call.answer()`;
+    /// `answer()` may also be called earlier — the call is answered as soon as the
+    /// INVITE is received. Use `Call.disconnect()` to decline.
+    ///
+    /// Calling this again with the same `callId` (duplicate push) returns the existing call.
+    ///
+    /// - Parameters:
+    ///   - push: Parsed push data (see `IncomingCallPush.init(payload:)`).
+    ///   - observer: A `CallObserver` that receives call events.
+    /// - Returns: A `Call` instance representing the incoming call.
+    func handleIncomingPush(_ push: IncomingCallPush, observer: CallObserver) -> Call
+
+
+    /// Registers the VoIP push token (`PKPushCredentials.token`) on the server,
+    /// so the server can deliver incoming call pushes to this device.
+    func registerPushToken(_ token: Data) async throws
+
+
     /// Configures the client with general call-related settings.
     ///
     /// - Parameter settings: A `CallSettings` object that controls
@@ -65,4 +68,37 @@ public protocol VoiceClient {
     /// - Parameter onComplete: A closure that is called once shutdown
     ///   is fully complete.
     func shutdown(onComplete: @escaping () -> Void)
+}
+
+
+public extension VoiceClient {
+    /// Creates and starts an audio call with default `CallOptions()`.
+    func makeCall(observer: CallObserver) -> Call {
+        makeCall(options: CallOptions(), observer: observer)
+    }
+
+
+    /// Parses a raw PushKit payload (`PKPushPayload.dictionaryPayload`) and handles
+    /// the incoming call. See `handleIncomingPush(_:observer:)`.
+    ///
+    /// - Throws: `CallError.invalidResponse` if the payload is not a valid incoming call push.
+    func handleIncomingPush(_ payload: [AnyHashable: Any], observer: CallObserver) throws -> Call {
+        guard let push = IncomingCallPush(payload: payload) else {
+            throw CallError.invalidResponse(message: "Invalid incoming call push payload")
+        }
+        return handleIncomingPush(push, observer: observer)
+    }
+
+
+    /// Callback-based variant of `registerPushToken(_:)`.
+    func registerPushToken(_ token: Data, completion: @escaping (Result<Void, CallError>) -> Void) {
+        Task {
+            do {
+                try await registerPushToken(token)
+                completion(.success(()))
+            } catch {
+                completion(.failure(CallError.from(error)))
+            }
+        }
+    }
 }

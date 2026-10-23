@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  SipManager.swift
 //  VoiceSDK
 //
 //  Created by Yurii Zhuk on 20.06.2025.
@@ -9,100 +9,241 @@ import Foundation
 import PJSIPKit
 
 
+/// All methods must be called on `SDKQueues.sip`.
 final class SipManager {
-    private var currentAcc = pjsua_acc_get_default()
+    private let logger = SDKLogger.make("voice.core.sip")
+    private var currentAcc = pjsua_acc_id(PJSUA_INVALID_ID.rawValue)
     weak var eventListener: SipEventListener?
-    
-    private let dispatchQueue = DispatchQueue(label: "com.webitel.sip.SipManager")
+
     private var settings: CallSettings = CallSettings()
     
     private var isDestroying = false
     private var isActivePjsip = false
-    
-    private let defaultGoogleStunServer = "stun.l.google.com:19302"
-    private let PJ_MAX_STUN_SERVERS = 8
+    private let videoDevices = SipVideoDevices()
 
+    /// Completions waiting for the result of an in-flight REGISTER.
+    private var registrationWaiters: [(Result<Void, Error>) -> Void] = []
+    
     init(listener: SipEventListener) {
         self.eventListener = listener
     }
 
 
-    func makeCall(sipConfig: SipConfig, toNumber: String, toName: String? = nil) throws -> Int32 {
-        var result: Result<Int32, Error>!
-        
-        dispatchQueue.sync {
-            do {
-                registerThread()
-                try start(config: sipConfig)
-                
-                let url = buildUrl(config: sipConfig, toNumber: toNumber, toName: toName)
-                var callId: Int32 = -1
-                var uri = pj_str(strdup(url))
-                
-                var callSettings = pjsua_call_setting()
-                pjsua_call_setting_default(&callSettings)
-                callSettings.vid_cnt = 0
-                callSettings.aud_cnt = 1
-                
-                let status = pjsua_call_make_call(currentAcc, &uri, &callSettings, nil, nil, &callId)
-                
-                if status != PJ_SUCCESS.rawValue {
-                    throw CallError.sipError(message: status.description)
-                }
-                
-                WLog.shared.debug("makeCall: success, call id: \(callId)")
-                result = .success(callId)
-                
-            } catch {
-                result = .failure(error)
-            }
-        }
-        return try result.get()
+    func makeCall(
+        sipConfig: SipConfig,
+        toNumber: String,
+        toName: String? = nil,
+        meetingId: String? = nil,
+        type: CallType,
+        orientation: VideoOrientation
+    ) throws -> Int32 {
+        let isVideo = type == .video
+        return try performMakeCall(
+            sipConfig: sipConfig,
+            toNumber: toNumber,
+            toName: toName,
+            meetingId: meetingId,
+            videoCount: isVideo ? 1 : 0,
+            orientation: isVideo ? orientation : nil
+        )
     }
-    
+
+
+    private func performMakeCall(
+        sipConfig: SipConfig,
+        toNumber: String,
+        toName: String?,
+        meetingId: String?,
+        videoCount: UInt32,
+        orientation: VideoOrientation?
+    ) throws -> Int32 {
+        registerSipThread()
+
+        // Establish the correct orientation for *this* call before the capture
+        // device is (re)opened, so the existing reapply points (initPjsuaConfigs'
+        // cold-start push, syncActiveCaptureDevice's post-open push) act on a value
+        // that reflects this call rather than whatever a previous, unrelated call
+        // last left `currentOrientation` set to.
+        if let orientation { try? setVideoOrientation(orientation) }
+
+        try start(config: sipConfig)
+
+        var owned = OwnedCStrings()
+        defer { owned.free() }
+
+        let url = buildUrl(config: sipConfig, toNumber: toNumber, toName: toName)
+        var callId: Int32 = -1
+        var uri = owned.pjString(url)
+
+        var callSettings = pjsua_call_setting()
+        pjsua_call_setting_default(&callSettings)
+        callSettings.vid_cnt = videoCount
+        callSettings.aud_cnt = 1
+
+        guard let pool = pjsua_pool_create("webitel-invite-hdrs", 512, 512) else {
+            throw CallError.sipError(message: "Failed to allocate header pool")
+        }
+        defer { pj_pool_release(pool) }
+
+        let msgData = makeMsgData()
+        defer { msgData.deallocate() }
+
+        if let meetingId, !meetingId.isEmpty {
+            addHeader(msgData, pool: pool, name: "X-Webitel-Meeting", value: meetingId)
+        }
+        addHeader(msgData, pool: pool, name: "X-FS-Support", value: "update_display,send_info")
+
+        let status = pjsua_call_make_call(currentAcc, &uri, &callSettings, nil, msgData, &callId)
+
+        if status != PJ_SUCCESS.rawValue {
+            throw CallError.sipError(message: status.description)
+        }
+
+        logger.debug("makeCall: success, call id: \(callId)")
+        return callId
+    }
+
+
+    /// `pjsua_msg_data_init` links `hdr_list`/`multipart_parts` to the struct's own
+    /// address, so it must live at a fixed address — not in a Swift `var`, which the
+    /// compiler is free to copy between `&` uses. Caller deallocates.
+    private func makeMsgData() -> UnsafeMutablePointer<pjsua_msg_data> {
+        let msgData = UnsafeMutablePointer<pjsua_msg_data>.allocate(capacity: 1)
+        msgData.initialize(to: pjsua_msg_data())
+        pjsua_msg_data_init(msgData)
+        return msgData
+    }
+
+
+    /// Adds one custom header to the outgoing INVITE. Allocated from `pool` (not the
+    /// stack) because `msgData.hdr_list` is a self-referential circular list — PJSIP
+    /// only needs it valid for the duration of the synchronous `pjsua_call_make_call`
+    /// call, but a stack-allocated header risks the linkage pointing at memory that's
+    /// no longer valid the moment this helper returns.
+    private func addHeader(_ msgData: UnsafeMutablePointer<pjsua_msg_data>, pool: UnsafeMutablePointer<pj_pool_t>, name: String, value: String) {
+        var owned = OwnedCStrings()
+        defer { owned.free() }
+        // The header copies both strings into `pool`.
+        var hname = owned.pjString(name)
+        var hvalue = owned.pjString(value)
+        guard let header = pjsip_generic_string_hdr_create(pool, &hname, &hvalue) else { return }
+        pj_list_push_back(&msgData.pointee.hdr_list, header)
+    }
+
+
+    /// Starts pjsua if needed and registers the SIP account. `completion` is called
+    /// on `SDKQueues.sip` once the registrar answers, or when the SIP stack is destroyed.
+    func register(sipConfig: SipConfig, completion: @escaping (Result<Void, Error>) -> Void) {
+        // Queued before anything can throw, so the `catch` below always completes it.
+        registrationWaiters.append(completion)
+        do {
+            registerSipThread()
+            try start(config: sipConfig)
+
+            let status = pjsua_acc_set_registration(currentAcc, pj_bool_t(PJ_TRUE.rawValue))
+            guard status == PJ_SUCCESS.rawValue else {
+                throw CallError.sipError(message: "Failed to start SIP registration: \(status.description)")
+            }
+            logger.debug("register: REGISTER sent for account \(currentAcc)")
+        } catch {
+            logger.error("register: \(error)")
+            completeRegistration(.failure(error))
+        }
+    }
+
+
+    /// Called from `on_reg_state2` with the final registrar response code.
+    func onRegistrationState(code: Int, reason: String?) {
+        SDKQueues.assertOnSip()
+        if (200..<300).contains(code) {
+            logger.debug("onRegistrationState: registered (\(code))")
+            completeRegistration(.success(()))
+        } else {
+            let message = ["SIP registration failed: \(code)", reason].compactMap { $0 }.joined(separator: " ")
+            logger.error("onRegistrationState: \(message)")
+            completeRegistration(.failure(CallError.registrationFailed(code: code, message: message)))
+        }
+    }
+
+
+    private func completeRegistration(_ result: Result<Void, Error>) {
+        let waiters = registrationWaiters
+        registrationWaiters.removeAll()
+        waiters.forEach { $0(result) }
+    }
+
+
+    func answerCall(withID id: Int32) throws {
+        try ensurePjsuaRunning()
+        startAudio()
+
+        var opt = pjsua_call_setting()
+        pjsua_call_setting_default(&opt)
+        opt.aud_cnt = 1
+        opt.vid_cnt = 0
+
+        let status = pjsua_call_answer2(pjsua_call_id(id), &opt, 200, nil, nil)
+        guard status == PJ_SUCCESS.rawValue else {
+            logger.error("answerCall: \(status.description)")
+            throw CallError.sipError(message: status.description)
+        }
+    }
+
+
+    func sendRinging(withID id: Int32) {
+        guard isPjsuaRunning else { return }
+        registerSipThread()
+        let status = pjsua_call_answer(pjsua_call_id(id), 180, nil, nil)
+        if status != PJ_SUCCESS.rawValue {
+            logger.warning("sendRinging: \(status.description)")
+        }
+    }
+
 
     func disconnectCall(withID id: Int32, code: UInt32) throws {
-        registerThread()
+        try ensurePjsuaRunning()
         let status = pjsua_call_hangup(pjsua_call_id(id), code, nil, nil)
         guard status == PJ_SUCCESS.rawValue else {
-            WLog.shared.error("disconnectCall: \(status.description)")
+            logger.error("disconnectCall: \(status.description)")
             throw CallError.sipError(message: status.description)
         }
     }
 
     
     func sendDTMF(_ digits: String, id: Int32) throws {
-        registerThread()
-        var f = pj_str(strdup(digits))
+        try ensurePjsuaRunning()
+        var owned = OwnedCStrings()
+        defer { owned.free() }
+        var f = owned.pjString(digits)
         let status = pjsua_call_dial_dtmf(pjsua_call_id(id), &f)
         guard status == PJ_SUCCESS.rawValue else {
-            WLog.shared.error("sendDTMF: \(status.description)")
+            logger.error("sendDTMF: \(status.description)")
             throw CallError.sipError(message: status.description)
         }
     }
     
 
     func setHold(_ onHold: Bool, id: Int32) throws {
-        registerThread()
+        try ensurePjsuaRunning()
         let status: pj_status_t = onHold ? pjsua_call_set_hold(pjsua_call_id(id), nil)
                                          : pjsua_call_reinvite(pjsua_call_id(id), 1, nil)
         guard status == PJ_SUCCESS.rawValue else {
-            WLog.shared.error("setHold: \(onHold), \(status.description)")
+            logger.error("setHold: \(onHold), \(status.description)")
             throw CallError.sipError(message: status.description)
         }
     }
     
 
     func setMute(_ mute: Bool, id: Int32) throws {
-        registerThread()
+        try ensurePjsuaRunning()
         var ci = pjsua_call_info()
         guard pjsua_call_get_info(id, &ci) == PJ_SUCCESS.rawValue else {
             let message = "Failed to get call info"
-            WLog.shared.error("setMute: \(message)")
+            logger.error("setMute: \(message)")
             throw CallError.invalidState(message: message)
         }
 
-        let medias: [pjsua_call_media_info] = tupleToArray(ci.media, as: pjsua_call_media_info.self)
+        let medias: [pjsua_call_media_info] = tupleToArray(ci.media)
         var processed = false
 
         for media in medias where media.type == PJMEDIA_TYPE_AUDIO {
@@ -114,15 +255,92 @@ final class SipManager {
 
         if !processed {
             let message = "No active audio media to mute/unmute"
-            WLog.shared.error("setMute: \(message)")
+            logger.error("setMute: \(message)")
             throw CallError.invalidState(message: message)
         }
     }
     
     
+    @discardableResult
+    func switchCamera(id: Int32) throws -> Int32 {
+        try videoDevices.switchCamera(id: id)
+    }
+
+
+    /// See `SipVideoDevices.syncActiveCaptureDevice`.
+    func syncActiveCaptureDevice(_ deviceId: Int32, callId: Int32) {
+        guard isPjsuaRunning else { return }
+        registerSipThread()
+        videoDevices.syncActiveCaptureDevice(deviceId, callId: callId)
+    }
+
+
+    func setVideoEnabled(_ enabled: Bool, id: Int32) throws {
+        try ensurePjsuaRunning()
+        var param = pjsua_call_vid_strm_op_param()
+        pjsua_call_vid_strm_op_param_default(&param)
+        param.med_idx = -1
+
+        let op = enabled ? PJSUA_CALL_VID_STRM_ADD : PJSUA_CALL_VID_STRM_REMOVE
+        let status = pjsua_call_set_vid_strm(pjsua_call_id(id), op, &param)
+        guard status == PJ_SUCCESS.rawValue else {
+            logger.error("setVideoEnabled: \(enabled), \(status.description)")
+            throw CallError.sipError(message: status.description)
+        }
+    }
+
+
+    func setLocalVideoPaused(_ paused: Bool, id: Int32) throws {
+        try ensurePjsuaRunning()
+        var param = pjsua_call_vid_strm_op_param()
+        pjsua_call_vid_strm_op_param_default(&param)
+        param.med_idx = -1
+
+        let op = paused ? PJSUA_CALL_VID_STRM_STOP_TRANSMIT : PJSUA_CALL_VID_STRM_START_TRANSMIT
+        let status = pjsua_call_set_vid_strm(pjsua_call_id(id), op, &param)
+        guard status == PJ_SUCCESS.rawValue else {
+            logger.error("setLocalVideoPaused: \(paused), \(status.description)")
+            throw CallError.sipError(message: status.description)
+        }
+    }
+
+
+    /// Sends an arbitrary in-dialog request (used for SIP INFO — see `MediaStateInfo`).
+    func sendInfo(contentType: String, body: String, id: Int32) throws {
+        try ensurePjsuaRunning()
+        var owned = OwnedCStrings()
+        defer { owned.free() }
+        var method = owned.pjString("INFO")
+        let msgData = makeMsgData()
+        defer { msgData.deallocate() }
+        msgData.pointee.content_type = owned.pjString(contentType)
+        msgData.pointee.msg_body = owned.pjString(body)
+
+        let status = pjsua_call_send_request(pjsua_call_id(id), &method, msgData)
+        guard status == PJ_SUCCESS.rawValue else {
+            logger.error("sendInfo: \(status.description)")
+            throw CallError.sipError(message: status.description)
+        }
+    }
+
+
+    /// See `SipVideoDevices.defaultCaptureDeviceId`.
+    func defaultCaptureDeviceId() -> Int32? {
+        guard isPjsuaRunning else { return nil }
+        registerSipThread()
+        return videoDevices.defaultCaptureDeviceId()
+    }
+
+
+    /// See `SipVideoDevices.setVideoOrientation`.
+    func setVideoOrientation(_ orientation: VideoOrientation) throws {
+        try videoDevices.setVideoOrientation(orientation)
+    }
+
+
     func startAudio() {
         guard !isDestroying, isActivePjsip else { return }
-        registerThread()
+        registerSipThread()
         
         var dev = pjsua_snd_dev_param()
         pjsua_snd_dev_param_default(&dev)
@@ -132,7 +350,7 @@ final class SipManager {
         
         let status = pjsua_set_snd_dev2(&dev)
         if status != PJ_SUCCESS.rawValue {
-            WLog.shared.error("startAudio: Error set sound dev, status: \(status.description)")
+            logger.error("startAudio: Error set sound dev, status: \(status.description)")
         }
     }
 
@@ -143,259 +361,113 @@ final class SipManager {
     
 
     func destroy(_ onComplete: @escaping () -> Void) {
-        dispatchQueue.async(flags: .barrier) {
-            self.registerThread()
-            WLog.shared.debug("Destroy the VoIP service...")
-            
-            guard self.isActivePjsip else {
-                onComplete()
-                return
-            }
-            
-            self.isDestroying = true
-            pjsua_call_hangup_all()
-            pjsua_destroy()
-            self.isActivePjsip = false
-            self.isDestroying = false
-            
-            WLog.shared.debug("VoIP service destroyed.")
+        registerSipThread()
+        logger.debug("Destroy the VoIP service...")
+
+        guard isActivePjsip else {
             onComplete()
+            return
         }
+
+        isDestroying = true
+        completeRegistration(.failure(CancellationError()))
+        pjsua_call_hangup_all()
+        pjsua_destroy()
+        isActivePjsip = false
+        currentAcc = pjsua_acc_id(PJSUA_INVALID_ID.rawValue)
+        isDestroying = false
+
+        logger.debug("VoIP service destroyed.")
+        onComplete()
     }
     
 
     private func start(config: SipConfig) throws {
-        WLog.shared.debug("Open a connection to \(config.getExtension()) with the domain \(config.getDomain()) and password \(config.getPassword()) and proxy \(config.getProxy())...")
+        logger.debug("Open a connection to \(config.getExtension()) with the domain \(config.getDomain()) and proxy \(config.getProxy())...")
         guard !isActivePjsip else {
-            WLog.shared.debug("pjsip already running")
+            logger.debug("pjsip already running")
             return
         }
-        
+
         try initPjsuaConfigs(config: config)
         isActivePjsip = true
     }
 
-    
+
     private func initPjsuaConfigs(config: SipConfig) throws {
-        registerThread()
+        registerSipThread()
         guard pjsua_create() == PJ_SUCCESS.rawValue else {
             let message = "Failed to create pjsua"
-            WLog.shared.error("initPjsuaConfigs: \(message)")
+            logger.error("initPjsuaConfigs: \(message)")
             throw CallError.sipError(message: message)
         }
 
-        // 2. Init configs
-        var cfg = pjsua_config()
-        var logCfg = pjsua_logging_config()
-        var mediaCfg = pjsua_media_config()
-        pjsua_config_default(&cfg)
-        pjsua_logging_config_default(&logCfg)
-        pjsua_media_config_default(&mediaCfg)
+        // A half-initialised pjsua must be torn down: the next `start()` calls
+        // `pjsua_create()` again, which wipes `pjsua_var` under any threads still running.
+        var started = false
+        defer { if !started { pjsua_destroy() } }
 
-        // Logging
-    #if DEBUG
-        logCfg.msg_logging = pj_bool_t(PJ_TRUE.rawValue)
-        logCfg.console_level = 5
-        logCfg.level = 5
-    #else
-        logCfg.msg_logging = pj_bool_t(PJ_FALSE.rawValue)
-        logCfg.console_level = 0
-        logCfg.level = 0
-    #endif
+        // PJSIP copies every string it keeps (`pjsua_init`, `pjsua_acc_add`).
+        var owned = OwnedCStrings()
+        defer { owned.free() }
 
-        // Media configuration
-        mediaCfg.has_ioqueue = pj_bool_t(PJ_FALSE.rawValue)
-        mediaCfg.quality = 5
-        mediaCfg.thread_cnt = 1
-        mediaCfg.clock_rate = 48000
-        mediaCfg.channel_count = 2
-        mediaCfg.ec_options = 0
-        mediaCfg.ec_tail_len = 0
-        mediaCfg.no_vad = pj_bool_t(PJ_TRUE.rawValue)
-        mediaCfg.enable_ice = settings.iceEnabled ? pj_bool_t(PJ_TRUE.rawValue) : pj_bool_t(PJ_FALSE.rawValue)
+        let configurator = SipEndpointConfigurator(settings: settings)
+        let isVideoEnabled = config.isVideoCallEnabled()
 
-        // STUN servers
-        var stunServers = settings.useDefaultStun ? [defaultGoogleStunServer] : []
-        stunServers.append(contentsOf: settings.stunServers.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
-        let count = min(stunServers.count, PJ_MAX_STUN_SERVERS)
-        cfg.stun_srv_cnt = UInt32(count)
-        if count > 0 {
-            withUnsafeMutablePointer(to: &cfg.stun_srv) { ptr in
-                let base = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: pj_str_t.self)
-                for i in 0..<count {
-                    stunServers[i].withCString { cString in
-                        base[i] = pj_str(strdup(cString))
-                    }
-                }
-            }
-        }
-
-        // Callbacks
-        cfg.cb.on_call_state = on_call_state
-        cfg.cb.on_call_media_state = on_call_media_state
-
-        // User agent
-        cfg.user_agent = pj_str(strdup("webitel for ios"))
+        // Init configs
+        var (cfg, logCfg, mediaCfg) = configurator.makeInitConfigs(isVideoEnabled: isVideoEnabled, owned: &owned)
 
         // Init pjsua
         guard pjsua_init(&cfg, &logCfg, &mediaCfg) == PJ_SUCCESS.rawValue else {
             let message = "Failed to init pjsua"
-            WLog.shared.error("initPjsuaConfigs: \(message)")
+            logger.error("initPjsuaConfigs: \(message)")
             throw CallError.sipError(message: message)
         }
 
         // Transport
-        let transport = transportFrom(sipUri: config.getProxy()) ?? .TCP_UDP
-        createTransport(transport)
+        configurator.createTransport(forProxy: config.getProxy())
         
-        /* Init account config */
-        let id = strdup("sip:\(config.getExtension())@\(config.getDomain())")
-        let username = strdup(config.getAuth())
-        let passwd = strdup(config.getPassword())
-        let realm = strdup("*")
-        let scheme = strdup("digest")
-
         // Account configuration
-        var accCfg = pjsua_acc_config()
-        pjsua_acc_config_default(&accCfg)
-        accCfg.id = pj_str(id)
-        
-        accCfg.cred_count = 1
-        accCfg.cred_info.0.username = pj_str(username)
-        accCfg.cred_info.0.realm = pj_str(realm)
-        accCfg.cred_info.0.data = pj_str(passwd)
-        accCfg.cred_info.0.scheme = pj_str(scheme)
-        accCfg.cred_info.0.data_type = 0
-        
-        accCfg.allow_contact_rewrite = settings.contactRewriteUse ? pj_bool_t(PJ_TRUE.rawValue) : pj_bool_t(PJ_FALSE.rawValue)
-        accCfg.allow_via_rewrite = settings.viaRewriteUse ? pj_bool_t(PJ_TRUE.rawValue) : pj_bool_t(PJ_FALSE.rawValue)
-        accCfg.allow_sdp_nat_rewrite = settings.sdpNatRewriteUse ? pj_bool_t(PJ_TRUE.rawValue) : pj_bool_t(PJ_FALSE.rawValue)
-        accCfg.use_srtp = getPjsipCode(code: settings.srtpUse)
-
-        // ICE config
-        if settings.iceEnabled {
-            accCfg.ice_cfg_use = PJSUA_ICE_CONFIG_USE_CUSTOM
-            accCfg.ice_cfg.enable_ice = pj_bool_t(PJ_TRUE.rawValue)
-            accCfg.ice_cfg.ice_always_update = pj_bool_t(PJ_TRUE.rawValue)
-        }
+        let renderDevice = isVideoEnabled ? videoDevices.nonMetalRenderDevice() : nil
+        // `pjsua_acc_config_default` links `reg_hdr_list`/`sub_hdr_list` to the struct's
+        // own address, so it must live at a fixed address (see `makeMsgData`).
+        let accCfg = UnsafeMutablePointer<pjsua_acc_config>.allocate(capacity: 1)
+        accCfg.initialize(to: pjsua_acc_config())
+        defer { accCfg.deallocate() }
+        pjsua_acc_config_default(accCfg)
+        configurator.configureAccount(accCfg, config: config, renderDevice: renderDevice, owned: &owned)
 
         // Add account
-        guard pjsua_acc_add(&accCfg, pj_bool_t(PJ_TRUE.rawValue), nil) == PJ_SUCCESS.rawValue else {
+        var accId = pjsua_acc_id(PJSUA_INVALID_ID.rawValue)
+        guard pjsua_acc_add(accCfg, pj_bool_t(PJ_TRUE.rawValue), &accId) == PJ_SUCCESS.rawValue else {
             let message = "Failed to add SIP account"
-            WLog.shared.error("initPjsuaConfigs: \(message)")
-            pjsua_destroy()
+            logger.error("initPjsuaConfigs: \(message)")
             throw CallError.sipError(message: message)
         }
 
-        /* Free strings */
-        free(id); free(username); free(passwd)
-        free(scheme); free(realm)
+        currentAcc = accId
 
         // Start pjsua
         guard pjsua_start() == PJ_SUCCESS.rawValue else {
             let message = "Failed to start pjsua"
-            WLog.shared.error("initPjsuaConfigs: \(message)")
+            logger.error("initPjsuaConfigs: \(message)")
+            currentAcc = pjsua_acc_id(PJSUA_INVALID_ID.rawValue)
             throw CallError.sipError(message: message)
         }
+        started = true
 
-        setCodecPriority()
+        if isVideoEnabled {
+            configurator.setupVideoCodec(w: 1280, h: 720)
+            videoDevices.reapplyOrientation()
+        }
+
+        configurator.setCodecPriority()
         pjsua_set_no_snd_dev()
         isActivePjsip = true
     }
 
-    
-    private func registerThread() {
-        if pj_thread_is_registered() == 0 {
-            var thread: OpaquePointer?
-            var desc = Array(repeating: 0, count: Int(PJ_THREAD_DESC_SIZE))
-            pj_thread_register(nil, &desc[0], &thread)
-        }
-    }
-    
 
     private func buildUrl(config: SipConfig, toNumber: String, toName: String? = nil) -> String {
         return "\"\(toName ?? "")\"<sip:\(toNumber)@\(config.getServerUri())>"
     }
-
-    
-    private func tupleToArray<T>(_ tuple: Any, as type: T.Type) -> [T] {
-        Mirror(reflecting: tuple).children.compactMap { $0.value as? T }
-    }
-    
-
-    private func setCodecPriority() {
-        let codecs = [
-            "opus/48000/2": PJMEDIA_CODEC_PRIO_HIGHEST.rawValue,
-            "G722/16000/1": 135,
-            "PCMU/8000/1": 133,
-            "PCMA/8000/1": PJMEDIA_CODEC_PRIO_NORMAL.rawValue,
-            "speex/16000/1": PJMEDIA_CODEC_PRIO_DISABLED.rawValue,
-            "speex/8000/1": PJMEDIA_CODEC_PRIO_DISABLED.rawValue,
-            "speex/32000/1": PJMEDIA_CODEC_PRIO_DISABLED.rawValue,
-            "iLBC/8000/1": PJMEDIA_CODEC_PRIO_DISABLED.rawValue,
-            "GSM/8000/1": PJMEDIA_CODEC_PRIO_DISABLED.rawValue
-        ]
-        var codec = pj_str_t()
-        for (name, prio) in codecs {
-            pjsua_codec_set_priority(pj_cstr(&codec, name), pj_uint8_t(prio))
-        }
-    }
-
-    
-    private func createTransport(_ transport: Transport) {
-        WLog.shared.debug("Create transport: \(transport)")
-        switch transport {
-            case .UDP: initTransport(type: PJSIP_TRANSPORT_UDP)
-            case .TCP: initTransport(type: PJSIP_TRANSPORT_TCP)
-            case .TLS: initTransport(type: PJSIP_TRANSPORT_TLS)
-            case .TCP_UDP: initTransport(type: PJSIP_TRANSPORT_TCP); initTransport(type: PJSIP_TRANSPORT_UDP)
-        }
-    }
-    
-
-    private func initTransport(type: pjsip_transport_type_e) {
-        pj_activesock_enable_iphone_os_bg(pj_bool_t(PJ_FALSE.rawValue))
-        var transportId = pjsua_transport_id()
-        var cfg = pjsua_transport_config()
-        pjsua_transport_config_default(&cfg)
-        cfg.qos_type = PJ_QOS_TYPE_VOICE
-        let status = pjsua_transport_create(type, &cfg, &transportId)
-        if status != PJ_SUCCESS.rawValue {
-            WLog.shared.warning("Transport \(type) not created")
-        }
-    }
-    
-
-    private func transportFrom(sipUri: String) -> Transport? {
-        let components = sipUri.split(separator: ";")
-        for comp in components {
-            let pair = comp.split(separator: "=")
-            if pair.count == 2, pair[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "transport" {
-                switch pair[1].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-                    case "tcp": return .TCP
-                    case "udp": return .UDP
-                    case "tls": return .TLS
-                    default: return nil
-                }
-            }
-        }
-        return nil
-    }
-
-
-    private func getPjsipCode(code: SrtpUse) -> pjmedia_srtp_use {
-        switch code {
-            case .PJMEDIA_SRTP_OPTIONAL: return PJMEDIA_SRTP_OPTIONAL
-            case .PJMEDIA_SRTP_MANDATORY: return PJMEDIA_SRTP_MANDATORY
-            default: return PJMEDIA_SRTP_DISABLED
-        }
-    }
-}
-
-
-enum Transport: Int, Codable, CaseIterable {
-    case UDP = 0
-    case TCP = 1
-    case TCP_UDP = 2
-    case TLS = 3
 }

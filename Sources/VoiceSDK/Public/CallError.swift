@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  CallError.swift
 //  VoiceSDK
 //
 //  Created by Yurii Zhuk on 27.06.2025.
@@ -10,7 +10,7 @@ import Foundation
 
 /// Represents different error cases that can occur during
 /// the lifecycle of a call or when interacting with SIP services.
-enum CallError: Error {
+public enum CallError: Error {
     /// Indicates that a response from the server or SIP stack
     /// was malformed, missing fields, or otherwise unusable.
     case invalidResponse(message: String)
@@ -34,8 +34,28 @@ enum CallError: Error {
     /// a non-success SIP status code was returned.
     case sipError(message: String)
     
+    /// Indicates that SIP registration was rejected by the registrar
+    /// or could not be completed. `code` is the final SIP response
+    /// code (e.g. 401, 403, 408, 503).
+    case registrationFailed(code: Int, message: String)
+    
     /// Represents an unknown or unexpected error that does not
     /// fit into other categories. Provides a message and a code
     /// for additional debugging information.
     case unknown(message: String, code: Int)
+}
+
+
+extension CallError {
+    /// Maps an arbitrary `Error` into a `CallError`, passing through values
+    /// that already are `CallError` unchanged.
+    static func from(_ error: Error) -> CallError {
+        if let callError = error as? CallError {
+            return callError
+        }
+        if error is CancellationError {
+            return .unknown(message: "Operation was cancelled", code: -2)
+        }
+        return .unknown(message: error.localizedDescription, code: -1)
+    }
 }

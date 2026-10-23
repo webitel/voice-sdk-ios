@@ -1,5 +1,5 @@
 //
-//  File.swift
+//  CallSettings.swift
 //  VoiceSDK
 //
 //  Created by Yurii Zhuk on 26.09.2025.
