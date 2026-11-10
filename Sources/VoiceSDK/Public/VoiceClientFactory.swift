@@ -22,6 +22,28 @@ public enum VoiceClientFactory {
         let deviceStorage: DeviceStorage = DeviceStorage()
         let normalizedBaseURL = normalizingScheme(of: baseURL)
 
+        SDKLogger.configure(
+            level: config.logLevel, handlerFactory: config.logHandler
+        )
+
+        var systemCallIntegration = config.systemCallIntegration
+        var callKit: CallKitCoordinator?
+        if case .sdkManaged(let callKitConfiguration) = systemCallIntegration {
+            callKit = CallKitCoordinator.make(configuration: callKitConfiguration, voiceManager: .shared)
+            if callKit == nil {
+                SDKLogger.make("VoiceSDK")
+                    .error("CallKit is already managed by another VoiceClient, falling back to SystemCallIntegration.none")
+                systemCallIntegration = .none
+            }
+        }
+        if systemCallIntegration.usesCallKit && !CallKitCoordinator.hasVoIPBackgroundMode {
+            SDKLogger.make("VoiceSDK")
+                .error("""
+                    CallKit requires the "voip" background mode: enable Background Modes → Voice over IP \
+                    (and Audio) in Signing & Capabilities. Calls will be refused by the system.
+                    """)
+        }
+
         let context = ClientContext(
             baseURL: normalizedBaseURL,
             clientToken: config.clientToken ?? "",
@@ -30,11 +52,8 @@ public enum VoiceClientFactory {
             deviceId: config.deviceId ?? deviceStorage.getDeviceId(),
             agent: systemDetails.userAgent,
             pinnedHashes: config.pinnedPublicKeys,
-            incomingCallTimeout: config.incomingCallTimeout
-        )
-
-        SDKLogger.configure(
-            level: config.logLevel, handlerFactory: config.logHandler
+            incomingCallTimeout: config.incomingCallTimeout,
+            systemCallIntegration: systemCallIntegration
         )
 
         if baseURL.scheme == nil {
@@ -52,7 +71,8 @@ public enum VoiceClientFactory {
             context: context,
             authManager: authManager,
             pushService: PushService(authManager: authManager, api: PushAPI(http: http)),
-            ratingService: RatingService(api: MeetingAPI(http: http))
+            ratingService: RatingService(api: MeetingAPI(http: http)),
+            callKit: callKit
         )
         return client as any VoiceClient
     }

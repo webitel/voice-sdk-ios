@@ -56,6 +56,21 @@ public protocol VoiceClient {
     func registerPushToken(_ token: Data) async throws
 
 
+    /// Tells the SDK that CallKit activated the audio session. Call it from
+    /// `CXProviderDelegate.provider(_:didActivate:)`.
+    ///
+    /// Used only with `SystemCallIntegration.hostManaged`: call audio starts
+    /// only after this. Ignored in other modes.
+    func audioSessionDidActivate()
+
+
+    /// Tells the SDK that CallKit deactivated the audio session. Call it from
+    /// `CXProviderDelegate.provider(_:didDeactivate:)`.
+    ///
+    /// Used only with `SystemCallIntegration.hostManaged`. Ignored in other modes.
+    func audioSessionDidDeactivate()
+
+
     /// Configures the client with general call-related settings.
     ///
     /// - Parameter settings: A `CallSettings` object that controls

@@ -175,7 +175,6 @@ final class SipManager {
 
     func answerCall(withID id: Int32) throws {
         try ensurePjsuaRunning()
-        startAudio()
 
         var opt = pjsua_call_setting()
         pjsua_call_setting_default(&opt)
@@ -352,6 +351,14 @@ final class SipManager {
         if status != PJ_SUCCESS.rawValue {
             logger.error("startAudio: Error set sound dev, status: \(status.description)")
         }
+    }
+
+
+    /// Releases the sound device; the conference bridge keeps running without it.
+    func stopAudio() {
+        guard !isDestroying, isActivePjsip else { return }
+        registerSipThread()
+        pjsua_set_no_snd_dev()
     }
 
     

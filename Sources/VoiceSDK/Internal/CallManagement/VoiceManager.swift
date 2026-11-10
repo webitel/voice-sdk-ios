@@ -31,11 +31,20 @@ final class VoiceManager: CallControlDelegate {
     let logger = SDKLogger.make("voice.core.voice")
 
     private(set) lazy var sipManager: SipManager = SipManager(listener: self)
-    private let audioRouter = CallAudioRouter()
+    private lazy var audioRouter = CallAudioRouter { [unowned self] isSpeakerActive in
+        self.calls.forEach { $0.syncSpeakerphone(isSpeakerActive) }
+    }
+    private(set) lazy var audioSession = AudioSessionController(
+        openDevice: { [unowned self] in self.sipManager.startAudio() },
+        closeDevice: { [unowned self] in self.sipManager.stopAudio() }
+    )
 
 
     static let shared = VoiceManager()
-    private init() {}
+    private init() {
+        // Observes route changes from the start, e.g. the CallKit speaker button.
+        _ = audioRouter
+    }
 
 
     /// See `CallRegistry.insert`.
@@ -51,6 +60,28 @@ final class VoiceManager: CallControlDelegate {
     func updateCallSettings(_ settings: CallSettings) {
         SDKQueues.sip.async {
             self.sipManager.updateCallSetting(settings)
+        }
+    }
+
+
+    /// With CallKit, call audio waits for `audioSessionDidActivate()`.
+    func setUsesCallKit(_ usesCallKit: Bool) {
+        SDKQueues.sip.async {
+            self.audioSession.setMode(usesCallKit ? .external : .automatic)
+        }
+    }
+
+
+    func audioSessionDidActivate() {
+        SDKQueues.sip.async {
+            self.audioSession.sessionDidActivate()
+        }
+    }
+
+
+    func audioSessionDidDeactivate() {
+        SDKQueues.sip.async {
+            self.audioSession.sessionDidDeactivate()
         }
     }
 
@@ -109,6 +140,7 @@ final class VoiceManager: CallControlDelegate {
         // Hold the other call before answering, not only on CONFIRMED, so both
         // calls' audio isn't bridged while the 200 OK is being acknowledged.
         if let call = registry.find(bySipId: id) { holdOtherCalls(except: call.id) }
+        audioSession.requestAudio()
         try sipManager.answerCall(withID: id)
     }
 
@@ -118,6 +150,11 @@ final class VoiceManager: CallControlDelegate {
             case .local(let uuid): disconnectLocalCall(uuid: uuid)
             case .sip(let sipId): try disconnectSipCall(sipId: sipId)
         }
+    }
+
+
+    var isSpeakerActive: Bool {
+        audioRouter.isSpeakerActive
     }
 
 
@@ -166,6 +203,7 @@ final class VoiceManager: CallControlDelegate {
     func shutdown(_ onComplete: @escaping () -> Void) {
         SDKQueues.sip.async {
             self.sipManager.destroy {
+                self.audioSession.reset()
                 SDKQueues.events.async(execute: onComplete)
             }
         }
@@ -187,7 +225,9 @@ final class VoiceManager: CallControlDelegate {
         } catch {
             logger.error("checkAndDestroySip: failed to reset audio route: \(error)")
         }
-        self.sipManager.destroy {}
+        self.sipManager.destroy {
+            self.audioSession.reset()
+        }
     }
 
 

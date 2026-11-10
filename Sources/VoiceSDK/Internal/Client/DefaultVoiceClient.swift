@@ -13,6 +13,8 @@ final class DefaultVoiceClient: VoiceClient {
     private let pushService: PushService
     private let ratingService: RatingService
     private let context: ClientContext
+    /// Set only in `SystemCallIntegration.sdkManaged` mode.
+    private let callKit: CallKitCoordinator?
     private let voiceManager: VoiceManager = VoiceManager.shared
     
     private let logger = SDKLogger.make("voice.core.client")
@@ -30,14 +32,17 @@ final class DefaultVoiceClient: VoiceClient {
         context: ClientContext,
         authManager: AuthManager,
         pushService: PushService,
-        ratingService: RatingService
+        ratingService: RatingService,
+        callKit: CallKitCoordinator? = nil
     ) {
         self.authManager = authManager
         self.pushService = pushService
         self.ratingService = ratingService
         self.context = context
+        self.callKit = callKit
 
         configure(context.callSettings)
+        voiceManager.setUsesCallKit(context.systemCallIntegration.usesCallKit)
     }
 
 
@@ -56,7 +61,7 @@ final class DefaultVoiceClient: VoiceClient {
             // Only incoming calls can wait: no outgoing call while another call exists.
             reject: { !$0.callsByUUID.isEmpty }
         ) {
-            CallImpl(
+            let call = CallImpl(
                 delegate: voiceManager,
                 ratingProvider: ratingService,
                 remoteName: options.toName,
@@ -65,6 +70,8 @@ final class DefaultVoiceClient: VoiceClient {
                 hasVideo: hasVideo,
                 initialOrientation: options.videoOrientation
             )
+            call.actionRouter = callKit
+            return call
         }
         call.addObserver(observer)
 
@@ -81,17 +88,25 @@ final class DefaultVoiceClient: VoiceClient {
 
         logger.debug("Making new \(hasVideo ? "video" : "audio") call")
 
-        call.apiTask {
-            do {
-                var config = try await self.authManager.getSipConfig(meetingId: options.meetingId)
-                if hasVideo {
-                    config.enableVideoCall()
+        let start = {
+            call.apiTask {
+                do {
+                    var config = try await self.authManager.getSipConfig(meetingId: options.meetingId)
+                    if hasVideo {
+                        config.enableVideoCall()
+                    }
+                    self.logger.debug("Calling service...")
+                    try await self.voiceManager.makeCallFor(call.id, config, options: options)
+                } catch {
+                    self.handleCallFailure(call, error)
                 }
-                self.logger.debug("Calling service...")
-                try await self.voiceManager.makeCallFor(call.id, config, options: options)
-            } catch {
-                self.handleCallFailure(call, error)
             }
+        }
+
+        if let callKit {
+            callKit.startOutgoing(call, options: options, start: start)
+        } else {
+            start()
         }
 
         return call
@@ -106,7 +121,7 @@ final class DefaultVoiceClient: VoiceClient {
             reject: { $0.callsByUUID.count >= VoiceManager.maxCalls }
         ) {
             // Created already `.ringing`, so `answer()` is valid as soon as this returns.
-            CallImpl(
+            let call = CallImpl(
                 delegate: voiceManager,
                 ratingProvider: ratingService,
                 id: push.callId,
@@ -115,17 +130,21 @@ final class DefaultVoiceClient: VoiceClient {
                 remoteNumber: push.fromNumber,
                 initialState: .ringing
             )
+            call.actionRouter = callKit
+            return call
         }
         call.addObserver(observer)
 
         switch outcome {
-            case .inserted: break
+            case .inserted:
+                callKit?.reportIncoming(call)
             case .existing:
                 logger.warning("Incoming call \(push.callId) already exists in state: \(call.state)")
                 return call
             case .rejected:
                 // Still returned so the app can report it to CallKit, as PushKit requires.
                 // The push isn't confirmed, so the server stops ringing on its own timeout.
+                callKit?.reportIncoming(call)
                 logger.warning("Incoming call \(push.callId) rejected: too many calls in progress")
                 call.disconnectWithReason(callEndReason: .from(code: 486, "Too many calls in progress"))
                 return call
@@ -159,9 +178,30 @@ final class DefaultVoiceClient: VoiceClient {
     }
 
 
+    // MARK: - Audio Session
+
+    func audioSessionDidActivate() {
+        guard case .hostManaged = context.systemCallIntegration else {
+            logger.warning("audioSessionDidActivate is used only with SystemCallIntegration.hostManaged, ignoring")
+            return
+        }
+        voiceManager.audioSessionDidActivate()
+    }
+
+
+    func audioSessionDidDeactivate() {
+        guard case .hostManaged = context.systemCallIntegration else {
+            logger.warning("audioSessionDidDeactivate is used only with SystemCallIntegration.hostManaged, ignoring")
+            return
+        }
+        voiceManager.audioSessionDidDeactivate()
+    }
+
+
     // MARK: - Shutdown
 
     func shutdown(onComplete: @escaping () -> Void) {
+        callKit?.endAllCalls()
         voiceManager.shutdown(onComplete)
     }
 

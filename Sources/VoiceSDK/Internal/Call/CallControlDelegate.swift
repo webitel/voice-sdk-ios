@@ -14,6 +14,7 @@ protocol CallControlDelegate: AnyObject {
     func holdCall(withID id: Int32, onHold: Bool) throws
     func sendDTMF(withID id: Int32, digits: String) throws
     func answerCall(withID id: Int32) throws
+    var isSpeakerActive: Bool { get }
     func setSpeakerphoneOn(_ enabled: Bool) throws
     func switchCamera(withID id: Int32) throws -> Int32
     func defaultCaptureDeviceId() -> Int32?

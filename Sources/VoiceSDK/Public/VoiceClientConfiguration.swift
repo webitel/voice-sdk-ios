@@ -41,4 +41,10 @@ public struct VoiceClientConfiguration {
     ///
     /// Default: `15`
     public var incomingCallTimeout: TimeInterval = 15
+
+
+    /// How calls are integrated with CallKit. See `SystemCallIntegration`.
+    ///
+    /// Default: `.none`
+    public var systemCallIntegration: SystemCallIntegration = .none
 }

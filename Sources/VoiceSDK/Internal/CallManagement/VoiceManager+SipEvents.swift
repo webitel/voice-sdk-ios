@@ -24,10 +24,9 @@ extension VoiceManager: SipEventListener {
             case PJSIP_INV_STATE_NULL, PJSIP_INV_STATE_CALLING, PJSIP_INV_STATE_CONNECTING:
                 logger.debug("Call connecting: \(state.rawValue)")
                 call.updateState(.connecting)
-                // With another call already ongoing the sound device is in use;
-                // re-setting it would interrupt that call's audio.
-                if state == PJSIP_INV_STATE_CONNECTING && !registry.hasOtherOngoingCall(except: call.id) {
-                    sipManager.startAudio()
+                // A no-op while another call already holds the sound device.
+                if state == PJSIP_INV_STATE_CONNECTING {
+                    audioSession.requestAudio()
                 }
 
             case PJSIP_INV_STATE_EARLY:
@@ -75,11 +74,11 @@ extension VoiceManager: SipEventListener {
         for cmi in mediaInfos where cmi.type == PJMEDIA_TYPE_AUDIO {
             switch cmi.status {
             case PJSUA_CALL_MEDIA_LOCAL_HOLD:
-                call.isHoldInProgress = false
+                call.holdTarget = nil
                 call.onHoldCallPJSIP(onHold: true)
 
             case PJSUA_CALL_MEDIA_ACTIVE:
-                call.isHoldInProgress = false
+                call.holdTarget = nil
                 registry.setActive(call)
                 holdOtherCalls(except: call.id)
                 call.onHoldCallPJSIP(onHold: false)

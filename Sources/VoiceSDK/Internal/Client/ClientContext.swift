@@ -16,6 +16,8 @@ internal struct ClientContext {
     public let agent: String
     public var pinnedHashes: [String]
     public let incomingCallTimeout: TimeInterval
+    /// Effective mode: `.sdkManaged` falls back to `.none` if CallKit is already managed by another client.
+    public let systemCallIntegration: SystemCallIntegration
 
     public init(
         baseURL: URL,
@@ -25,7 +27,8 @@ internal struct ClientContext {
         deviceId: String,
         agent: String,
         pinnedHashes: [String] = [],
-        incomingCallTimeout: TimeInterval = 15
+        incomingCallTimeout: TimeInterval = 15,
+        systemCallIntegration: SystemCallIntegration = .none
     ) {
         self.baseURL = baseURL
         self.clientToken = clientToken
@@ -35,5 +38,6 @@ internal struct ClientContext {
         self.agent = agent
         self.pinnedHashes = pinnedHashes
         self.incomingCallTimeout = incomingCallTimeout
+        self.systemCallIntegration = systemCallIntegration
     }
 }

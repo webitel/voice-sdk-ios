@@ -106,9 +106,4 @@ final class CallRegistry {
             }
         }
     }
-
-
-    func hasOtherOngoingCall(except exceptId: UUID) -> Bool {
-        state.read { $0.callsByUUID.values.contains { $0.id != exceptId && $0.state == .ongoing } }
-    }
 }

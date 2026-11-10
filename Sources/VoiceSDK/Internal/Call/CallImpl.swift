@@ -18,7 +18,7 @@ class CallImpl: Call {
     private struct Snapshot {
         var state: CallState = .idle
         var sipId: Int32 = PJSUA_INVALID_ID.rawValue
-        var isHoldInProgress = false
+        var holdTarget: Bool?
         var isMuted = false
         var isOnHold = false
         var hasVideo = false
@@ -36,6 +36,8 @@ class CallImpl: Call {
     private let observers = CallObserverHub()
     private let apiConfigTask = Protected<Task<Void, Never>?>(nil)
     weak var delegate: (CallControlDelegate)?
+    /// Takes over user actions in SDK-managed CallKit mode.
+    weak var actionRouter: CallActionRouter?
     private let ratingProvider: CallRatingProvider
     let logger = SDKLogger.make("voice.core.call")
 
@@ -56,9 +58,13 @@ class CallImpl: Call {
         get { store.read { $0.sipId } }
         set { store.write { $0.sipId = newValue } }
     }
+    /// The hold state a hold/unhold re-INVITE is in flight for; `nil` when none is.
+    var holdTarget: Bool? {
+        get { store.read { $0.holdTarget } }
+        set { store.write { $0.holdTarget = newValue } }
+    }
     var isHoldInProgress: Bool {
-        get { store.read { $0.isHoldInProgress } }
-        set { store.write { $0.isHoldInProgress = newValue } }
+        holdTarget != nil
     }
     var state: CallState {
         get { store.read { $0.state } }
@@ -179,12 +185,121 @@ class CallImpl: Call {
 
     func mute(_ mute: Bool) throws {
         logger.debug("mute \(mute)")
-        try enqueue("mute", validate: { [self] in
-            try ensureMediaControlAllowed()
-            try ensureSipIdValid()
-        }) { [self] in
-            performMute(mute)
+        try submit(.mute(mute))
+    }
+
+
+    func hold(_ hold: Bool) throws {
+        logger.debug("hold \(hold)")
+        if case .ongoing = state, isHoldSatisfied(hold) {
+            logger.debug("hold \(hold) - no action needed")
+            return
         }
+        try submit(.hold(hold))
+    }
+
+
+    func sendDTMF(_ digits: String) throws {
+        logger.debug("sendDTMF \(digits)")
+        try submit(.dtmf(digits))
+    }
+
+
+    func answer() throws {
+        logger.debug("answer call")
+        try submit(.answer)
+    }
+
+
+    func disconnect() throws {
+        logger.debug("disconnect call")
+        // Stop an in-flight SIP config/registration right away, not only once the queue gets here.
+        if case .disconnected = state {} else if sipId < 0 { cancelTask() }
+        try submit(.end)
+    }
+
+
+    // MARK: - Actions
+
+    /// Like `enqueue`, but lets `actionRouter` take the action over first (CallKit),
+    /// in which case it comes back through `performAction(_:)`.
+    private func submit(_ action: CallAction) throws {
+        try validate(action)
+        if actionRouter?.route(action, for: self) == true { return }
+        SDKQueues.sip.async { [self] in
+            do {
+                try performAction(action)
+            } catch {
+                logger.error("\(action): \(error)")
+            }
+        }
+    }
+
+
+    /// Performs a validated action without routing it. Re-validates first, since the
+    /// state may have changed since it was submitted. Must be called on `SDKQueues.sip`.
+    func performAction(_ action: CallAction) throws {
+        SDKQueues.assertOnSip()
+        try validate(action)
+        switch action {
+            case .answer: try performAnswer()
+            case .end: try internalDisconnect(CallEndReason.from(code: 0), cancelTask: true)
+            case .mute(let muted): performMute(muted)
+            case .hold(let onHold): try performHold(onHold)
+            case .dtmf(let digits): try delegate?.sendDTMF(withID: sipId, digits: digits)
+        }
+    }
+
+
+    private func validate(_ action: CallAction) throws {
+        switch action {
+            case .answer:
+                guard !isOutgoing else {
+                    let message = "Only incoming calls can be answered"
+                    logger.error("\(message)")
+                    throw CallError.invalidState(message: message)
+                }
+                guard case .ringing = state else {
+                    let message = "Call is not ringing. Current state: \(state)"
+                    logger.error("\(message)")
+                    throw CallError.invalidState(message: message)
+                }
+
+            case .end:
+                if case .disconnected = state {
+                    logger.error("Call already disconnected — ignoring")
+                    throw CallError.invalidState(message: state.description)
+                }
+
+            case .mute:
+                try ensureMediaControlAllowed()
+                try ensureSipIdValid()
+
+            case .hold(let onHold):
+                if case .ongoing = state, isHoldSatisfied(onHold) { return }
+                try ensureHoldAllowed()
+
+            case .dtmf:
+                try ensureCallOngoing()
+                try ensureSipIdValid()
+        }
+    }
+
+
+    private func performAnswer() throws {
+        if sipId < 0 {
+            // INVITE not received yet — answered in `onIncomingInviteReceived`.
+            logger.debug("answer: INVITE not received yet, answer is pending")
+            pendingAnswer = true
+        } else {
+            do {
+                try delegate?.answerCall(withID: sipId)
+            } catch {
+                disconnectWithReason(callEndReason: .from(code: -1, "\(error)"))
+                throw error
+            }
+        }
+        updateState(.connecting)
     }
 
 
@@ -208,86 +323,25 @@ class CallImpl: Call {
     }
 
 
-    func hold(_ hold: Bool) throws {
-        logger.debug("hold \(hold)")
-        try enqueue("hold", validate: { [self] in
-            try ensureHoldAllowed()
-        }) { [self] in
-            try performHold(hold)
-        }
-    }
-
-
     /// Also used by `VoiceManager` to hold this call when another one becomes active.
+    /// Idempotent: CallKit may request a hold the SDK already started, and vice versa.
     /// Must be called on `SDKQueues.sip`.
     func performHold(_ hold: Bool) throws {
         SDKQueues.assertOnSip()
-        try ensureHoldAllowed()
-        if isOnHold == hold {
+        if case .ongoing = state, isHoldSatisfied(hold) {
             logger.debug("hold \(hold) - no action needed")
             return
         }
+        try ensureHoldAllowed()
 
         try delegate?.holdCall(withID: sipId, onHold: hold)
-        isHoldInProgress = true
+        holdTarget = hold
     }
 
 
-    func sendDTMF(_ digits: String) throws {
-        logger.debug("sendDTMF \(digits)")
-        try enqueue("sendDTMF", validate: { [self] in
-            try ensureCallOngoing()
-            try ensureSipIdValid()
-        }) { [self] in
-            try delegate?.sendDTMF(withID: sipId, digits: digits)
-        }
-    }
-
-
-    func answer() throws {
-        logger.debug("answer call")
-        try enqueue("answer", validate: { [self] in
-            guard !isOutgoing else {
-                let message = "Only incoming calls can be answered"
-                logger.error("\(message)")
-                throw CallError.invalidState(message: message)
-            }
-            guard case .ringing = state else {
-                let message = "Call is not ringing. Current state: \(state)"
-                logger.error("\(message)")
-                throw CallError.invalidState(message: message)
-            }
-        }) { [self] in
-            if sipId < 0 {
-                // INVITE not received yet — answered in `onIncomingInviteReceived`.
-                logger.debug("answer: INVITE not received yet, answer is pending")
-                pendingAnswer = true
-            } else {
-                do {
-                    try delegate?.answerCall(withID: sipId)
-                } catch {
-                    disconnectWithReason(callEndReason: .from(code: -1, "\(error)"))
-                    throw error
-                }
-            }
-            updateState(.connecting)
-        }
-    }
-
-
-    func disconnect() throws {
-        logger.debug("disconnect call")
-        // Stop an in-flight SIP config/registration right away, not only once the queue gets here.
-        if case .disconnected = state {} else if sipId < 0 { cancelTask() }
-
-        try enqueue("disconnect", validate: { [self] in
-            if case .disconnected = state {
-                logger.error("Call already disconnected — ignoring")
-                throw CallError.invalidState(message: state.description)
-            }
-        }) { [self] in
-            try internalDisconnect(CallEndReason.from(code: 0), cancelTask: true)
-        }
+    /// The call is in, or already on its way to, the requested hold state.
+    private func isHoldSatisfied(_ hold: Bool) -> Bool {
+        (holdTarget ?? isOnHold) == hold
     }
 
 
@@ -314,14 +368,24 @@ class CallImpl: Call {
     }
 
 
+    /// Compares against the actual route rather than `isSpeakerphoneOn`: the route
+    /// may have been changed outside the SDK (e.g. the CallKit speaker button).
     private func applySpeakerphone(_ enabled: Bool) throws {
-        if isSpeakerphoneOn == enabled {
+        if delegate?.isSpeakerActive == enabled {
+            syncSpeakerphone(enabled)
             return
         }
 
         try delegate?.setSpeakerphoneOn(enabled)
-        isSpeakerphoneOn = enabled
-        notify(.localMedia(.speakerphoneChanged(callId: id, isSpeakerphoneOn: enabled)))
+        syncSpeakerphone(enabled)
+    }
+
+
+    /// Reflects the actual audio route; called on `SDKQueues.sip` on every route change.
+    func syncSpeakerphone(_ isOn: Bool) {
+        guard isSpeakerphoneOn != isOn else { return }
+        isSpeakerphoneOn = isOn
+        notify(.localMedia(.speakerphoneChanged(callId: id, isSpeakerphoneOn: isOn)))
     }
 
 
