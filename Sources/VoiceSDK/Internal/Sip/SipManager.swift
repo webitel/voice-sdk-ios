@@ -340,6 +340,34 @@ final class SipManager {
     }
 
 
+    /// RTCP counters of the call's first active audio stream, or `nil` if there is none.
+    func audioStreamStat(id: Int32) -> SipStreamStat? {
+        guard isPjsuaRunning else { return nil }
+        registerSipThread()
+
+        var ci = pjsua_call_info()
+        guard pjsua_call_get_info(pjsua_call_id(id), &ci) == PJ_SUCCESS.rawValue else { return nil }
+        let mediaInfos: [pjsua_call_media_info] = tupleToArray(ci.media)
+        guard let index = mediaInfos.prefix(Int(ci.media_cnt)).firstIndex(where: {
+            $0.type == PJMEDIA_TYPE_AUDIO && $0.status == PJSUA_CALL_MEDIA_ACTIVE
+        }) else { return nil }
+
+        var stat = pjsua_stream_stat()
+        guard pjsua_call_get_stream_stat(pjsua_call_id(id), UInt32(index), &stat) == PJ_SUCCESS.rawValue else {
+            return nil
+        }
+        let rtcp = stat.rtcp
+        return SipStreamStat(
+            rxPkt: Int64(rtcp.rx.pkt),
+            rxLoss: Int64(rtcp.rx.loss),
+            txPkt: Int64(rtcp.tx.pkt),
+            txLoss: Int64(rtcp.tx.loss),
+            txReports: Int64(rtcp.tx.update_cnt),
+            rttMs: Int(rtcp.rtt.last) / 1000
+        )
+    }
+
+
     /// See `SipVideoDevices.defaultCaptureDeviceId`.
     func defaultCaptureDeviceId() -> Int32? {
         guard isPjsuaRunning else { return nil }

@@ -46,9 +46,17 @@ public enum ConnectionEvent {
         state: CallState
     )
 
+    /// The estimated connection quality changed — see `Call.connectionQuality`. Not reported
+    /// when the call ends: `Call.connectionQuality` then silently becomes `.unknown`.
+    case qualityChanged(
+        callId: UUID,
+        quality: ConnectionQuality
+    )
+
     var callId: UUID {
         switch self {
-        case .stateChanged(let id, _):
+        case .stateChanged(let id, _),
+             .qualityChanged(let id, _):
             return id
         }
     }

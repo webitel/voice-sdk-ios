@@ -199,6 +199,11 @@ final class VoiceManager: CallControlDelegate {
     }
 
 
+    func audioStreamStat(withID id: Int32) -> SipStreamStat? {
+        sipManager.audioStreamStat(id: id)
+    }
+
+
     /// `onComplete` is called on `SDKQueues.events`.
     func shutdown(_ onComplete: @escaping () -> Void) {
         SDKQueues.sip.async {

@@ -23,4 +23,6 @@ protocol CallControlDelegate: AnyObject {
     func setLocalVideoPaused(withID id: Int32, paused: Bool) throws
     func setVideoOrientation(withID id: Int32, orientation: VideoOrientation) throws
     func sendMediaStateInfo(withID id: Int32, audioMuted: Bool, videoMuted: Bool, hold: Bool) throws
+    /// RTCP counters of the call's audio stream, or `nil` if unavailable.
+    func audioStreamStat(withID id: Int32) -> SipStreamStat?
 }

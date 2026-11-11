@@ -30,6 +30,7 @@ class CallImpl: Call {
         var isRemoteVideoPaused = false
         var isLocalVideoActive = false
         var isRemoteVideoActive = false
+        var connectionQuality: ConnectionQuality = .unknown
     }
 
     private let store = Protected(Snapshot())
@@ -115,6 +116,19 @@ class CallImpl: Call {
         set { store.write { $0.isRemoteVideoActive = newValue } }
     }
 
+    private(set) var connectionQuality: ConnectionQuality {
+        get { store.read { $0.connectionQuality } }
+        set { store.write { $0.connectionQuality = newValue } }
+    }
+    
+    private let initialOrientation: VideoOrientation
+
+    /// The remote party holds the audio via SDP (`PJSUA_CALL_MEDIA_REMOTE_HOLD`). Confined to `SDKQueues.sip`.
+    var isAudioRemoteHeld = false
+
+    /// Confined to `SDKQueues.sip`.
+    private(set) lazy var qualityMonitor = ConnectionQualityMonitor(host: self)
+
     /// `answer()` was called before the incoming INVITE arrived.
     var pendingAnswer = false
     var incomingTimeout: DispatchWorkItem?
@@ -131,10 +145,6 @@ class CallImpl: Call {
     var isAnswered: Bool {
         answeredAt > 0
     }
-
-
-    /// See `CallVideoController.initialOrientation`.
-    private let initialOrientation: VideoOrientation
 
     init(
         delegate: CallControlDelegate,
@@ -159,26 +169,6 @@ class CallImpl: Call {
         store.write {
             $0.hasVideo = hasVideo
             $0.state = initialState
-        }
-    }
-
-
-    /// Validates synchronously so the caller gets `invalidState` right away, then runs
-    /// `action` on `SDKQueues.sip`, re-validating first since the state may have changed
-    /// in between. Errors there can no longer reach the caller and are logged.
-    private func enqueue(
-        _ name: String,
-        validate: @escaping () throws -> Void,
-        action: @escaping () throws -> Void
-    ) throws {
-        try validate()
-        SDKQueues.sip.async { [self] in
-            do {
-                try validate()
-                try action()
-            } catch {
-                logger.error("\(name): \(error)")
-            }
         }
     }
 
@@ -219,8 +209,49 @@ class CallImpl: Call {
     }
 
 
-    // MARK: - Actions
+    /// Performs a validated action without routing it. Re-validates first, since the
+    /// state may have changed since it was submitted. Must be called on `SDKQueues.sip`.
+    func performAction(_ action: CallAction) throws {
+        SDKQueues.assertOnSip()
+        try validate(action)
+        switch action {
+            case .answer: try performAnswer()
+            case .end: try internalDisconnect(CallEndReason.from(code: 0), cancelTask: true)
+            case .mute(let muted): performMute(muted)
+            case .hold(let onHold): try performHold(onHold)
+            case .dtmf(let digits): try delegate?.sendDTMF(withID: sipId, digits: digits)
+        }
+    }
+    
+    
+    /// Also used by `VoiceManager` to hold this call when another one becomes active.
+    /// Idempotent: CallKit may request a hold the SDK already started, and vice versa.
+    /// Must be called on `SDKQueues.sip`.
+    func performHold(_ hold: Bool) throws {
+        SDKQueues.assertOnSip()
+        if case .ongoing = state, isHoldSatisfied(hold) {
+            logger.debug("hold \(hold) - no action needed")
+            return
+        }
+        try ensureHoldAllowed()
 
+        try delegate?.holdCall(withID: sipId, onHold: hold)
+        holdTarget = hold
+    }
+    
+    
+    /// Can be called from any thread; the disconnect itself runs on `SDKQueues.sip`.
+    func disconnectWithReason(callEndReason: CallEndReason) {
+        SDKQueues.sip.async { [self] in
+            do {
+                try internalDisconnect(callEndReason)
+            } catch {
+                logger.error("disconnectWithReason: error – \(error)")
+            }
+        }
+    }
+    
+    
     /// Like `enqueue`, but lets `actionRouter` take the action over first (CallKit),
     /// in which case it comes back through `performAction(_:)`.
     private func submit(_ action: CallAction) throws {
@@ -234,19 +265,24 @@ class CallImpl: Call {
             }
         }
     }
-
-
-    /// Performs a validated action without routing it. Re-validates first, since the
-    /// state may have changed since it was submitted. Must be called on `SDKQueues.sip`.
-    func performAction(_ action: CallAction) throws {
-        SDKQueues.assertOnSip()
-        try validate(action)
-        switch action {
-            case .answer: try performAnswer()
-            case .end: try internalDisconnect(CallEndReason.from(code: 0), cancelTask: true)
-            case .mute(let muted): performMute(muted)
-            case .hold(let onHold): try performHold(onHold)
-            case .dtmf(let digits): try delegate?.sendDTMF(withID: sipId, digits: digits)
+    
+    
+    /// Validates synchronously so the caller gets `invalidState` right away, then runs
+    /// `action` on `SDKQueues.sip`, re-validating first since the state may have changed
+    /// in between. Errors there can no longer reach the caller and are logged.
+    private func enqueue(
+        _ name: String,
+        validate: @escaping () throws -> Void,
+        action: @escaping () throws -> Void
+    ) throws {
+        try validate()
+        SDKQueues.sip.async { [self] in
+            do {
+                try validate()
+                try action()
+            } catch {
+                logger.error("\(name): \(error)")
+            }
         }
     }
 
@@ -323,41 +359,11 @@ class CallImpl: Call {
     }
 
 
-    /// Also used by `VoiceManager` to hold this call when another one becomes active.
-    /// Idempotent: CallKit may request a hold the SDK already started, and vice versa.
-    /// Must be called on `SDKQueues.sip`.
-    func performHold(_ hold: Bool) throws {
-        SDKQueues.assertOnSip()
-        if case .ongoing = state, isHoldSatisfied(hold) {
-            logger.debug("hold \(hold) - no action needed")
-            return
-        }
-        try ensureHoldAllowed()
-
-        try delegate?.holdCall(withID: sipId, onHold: hold)
-        holdTarget = hold
-    }
-
-
     /// The call is in, or already on its way to, the requested hold state.
     private func isHoldSatisfied(_ hold: Bool) -> Bool {
         (holdTarget ?? isOnHold) == hold
     }
 
-
-    /// Can be called from any thread; the disconnect itself runs on `SDKQueues.sip`.
-    func disconnectWithReason(callEndReason: CallEndReason) {
-        SDKQueues.sip.async { [self] in
-            do {
-                try internalDisconnect(callEndReason)
-            } catch {
-                logger.error("disconnectWithReason: error – \(error)")
-            }
-        }
-    }
-
-
-    // MARK: - Media Controls
 
     func setSpeakerphoneOn(_ enabled: Bool) throws {
         try enqueue("setSpeakerphoneOn", validate: { [self] in
@@ -603,5 +609,42 @@ class CallImpl: Call {
         } else {
             try delegate?.disconnectCall(.sip(id: sipId))
         }
+    }
+}
+
+
+// MARK: - ConnectionQualityMonitorHost (on `SDKQueues.sip`)
+
+extension CallImpl: ConnectionQualityMonitorHost {
+
+    func readStreamStat() -> SipStreamStat? {
+        guard sipId >= 0 else { return nil }
+        return delegate?.audioStreamStat(withID: sipId)
+    }
+
+    var isQualityMonitorEnded: Bool {
+        if case .disconnected = state { return true }
+        return false
+    }
+
+    var isQualityMonitorPaused: Bool {
+        // Hold may be signalled by SIP INFO (our SDKs) or only by SDP (any other client).
+        isOnHold || isRemoteOnHold || isAudioRemoteHeld
+    }
+
+    var expectsIncomingMedia: Bool {
+        !isRemoteMuted
+    }
+
+    func onConnectionQualityChanged(_ quality: ConnectionQuality) {
+        connectionQuality = quality
+        notify(.connection(.qualityChanged(callId: id, quality: quality)))
+    }
+
+
+    /// Stops the monitor; the quality silently becomes `.unknown` (no event).
+    func stopQualityMonitor() {
+        qualityMonitor.stop()
+        connectionQuality = .unknown
     }
 }

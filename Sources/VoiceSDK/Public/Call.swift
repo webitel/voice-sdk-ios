@@ -60,6 +60,12 @@ public protocol Call {
     /// for the remote side.
     var isRemoteVideoPaused: Bool { get }
 
+    /// Estimated quality of this device's connection to the media server (not the other
+    /// party's). Measured every few seconds from RTCP statistics while the call is
+    /// `.ongoing` and not on hold; `.unknown` otherwise. Changes are reported with
+    /// `ConnectionEvent.qualityChanged`. See `ConnectionQuality`.
+    var connectionQuality: ConnectionQuality { get }
+
     /// Current local/remote video activity of the call.
     var videoState: VideoState { get }
 

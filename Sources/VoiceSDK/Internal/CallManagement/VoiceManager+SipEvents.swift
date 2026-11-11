@@ -45,6 +45,7 @@ extension VoiceManager: SipEventListener {
                 call.onConfirmedPJSIP()
 
             case PJSIP_INV_STATE_DISCONNECTED:
+                call.stopQualityMonitor()
                 call.updateState(.disconnected(CallEndReason.from(code: lastStatusCode, lastReason)))
                 // Before `disconnectLocalCall`, which may destroy pjsua — the preview
                 // can only be stopped while the stack is still running.
@@ -75,13 +76,20 @@ extension VoiceManager: SipEventListener {
             switch cmi.status {
             case PJSUA_CALL_MEDIA_LOCAL_HOLD:
                 call.holdTarget = nil
+                call.isAudioRemoteHeld = false
                 call.onHoldCallPJSIP(onHold: true)
 
             case PJSUA_CALL_MEDIA_ACTIVE:
                 call.holdTarget = nil
+                call.isAudioRemoteHeld = false
                 registry.setActive(call)
                 holdOtherCalls(except: call.id)
                 call.onHoldCallPJSIP(onHold: false)
+
+            case PJSUA_CALL_MEDIA_REMOTE_HOLD:
+                // The remote party put the call on hold via SDP (sendonly/inactive) —
+                // independent of the SIP INFO `hold` flag, which only our SDKs send.
+                call.isAudioRemoteHeld = true
 
             default: break
             }

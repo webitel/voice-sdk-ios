@@ -66,6 +66,7 @@ extension CallImpl {
         updateState(.ongoing)
         autoEnableSpeakerForVideo()
         sendMediaStateInfo()
+        qualityMonitor.start()
     }
 
 
