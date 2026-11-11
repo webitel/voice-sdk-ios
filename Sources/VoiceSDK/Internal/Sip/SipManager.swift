@@ -68,6 +68,14 @@ final class SipManager {
 
         try start(config: sipConfig)
 
+        // pjsua may already be running from an earlier call: re-apply the preset so a
+        // `VoiceClient.configure(_:)` change (or this call's orientation) takes effect
+        // when the codec is opened for this call.
+        if let orientation, sipConfig.isVideoCallEnabled() {
+            SipEndpointConfigurator(settings: settings)
+                .applyVideoQuality(settings.videoQuality, orientation: orientation)
+        }
+
         var owned = OwnedCStrings()
         defer { owned.free() }
 
@@ -276,6 +284,15 @@ final class SipManager {
 
     func setVideoEnabled(_ enabled: Bool, id: Int32) throws {
         try ensurePjsuaRunning()
+
+        // Video added to an audio call (incoming calls are always answered audio-only)
+        // opens the codec now: re-apply the preset so a `VoiceClient.configure(_:)`
+        // change made after pjsua started takes effect, like in `performMakeCall`.
+        if enabled {
+            SipEndpointConfigurator(settings: settings)
+                .applyVideoQuality(settings.videoQuality, orientation: videoDevices.currentOrientation)
+        }
+
         var param = pjsua_call_vid_strm_op_param()
         pjsua_call_vid_strm_op_param_default(&param)
         param.med_idx = -1
@@ -464,7 +481,7 @@ final class SipManager {
         started = true
 
         if isVideoEnabled {
-            configurator.setupVideoCodec(w: 1280, h: 720)
+            configurator.applyVideoQuality(settings.videoQuality, orientation: videoDevices.currentOrientation)
             videoDevices.reapplyOrientation()
         }
 

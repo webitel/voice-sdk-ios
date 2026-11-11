@@ -47,4 +47,11 @@ public struct VoiceClientConfiguration {
     ///
     /// Default: `.none`
     public var systemCallIntegration: SystemCallIntegration = .none
+
+
+    /// Initial call configuration: NAT traversal, media encryption and
+    /// `CallSettings.videoQuality`. Replace it later with `VoiceClient.configure(_:)`.
+    ///
+    /// Default: `CallSettings()`
+    public var callSettings: CallSettings = CallSettings()
 }

@@ -52,7 +52,13 @@ public struct CallSettings: Codable {
     
     /// Specify whether secure media transport should be used for this account.
     public var srtpUse: SrtpUse = .PJMEDIA_SRTP_DISABLED
-    
+
+    /// Video encoding preset for all calls of the client. Default: `.medium`.
+    ///
+    /// Changed through `VoiceClient.configure(_:)`, it applies to video calls
+    /// started afterwards; an ongoing call keeps its current encoding.
+    public var videoQuality: VideoQuality = .default
+
     // MARK: - Other Options
     
     /// If enabled, incoming calls will return a

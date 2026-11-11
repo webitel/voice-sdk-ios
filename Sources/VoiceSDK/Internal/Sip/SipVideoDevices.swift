@@ -127,7 +127,7 @@ final class SipVideoDevices {
 
     /// Last orientation applied via `setVideoOrientation`, re-applied to the active
     /// capture device after `switchCamera()` since the setting is per-device.
-    private var currentOrientation: VideoOrientation = .portrait
+    private(set) var currentOrientation: VideoOrientation = .portrait
 
 
     /// Applies the given physical device orientation to the currently active video

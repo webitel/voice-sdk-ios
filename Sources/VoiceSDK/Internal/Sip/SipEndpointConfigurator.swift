@@ -155,7 +155,10 @@ struct SipEndpointConfigurator {
     }
 
 
-    func setupVideoCodec(w: UInt32, h: UInt32) {
+    /// Writes the `VideoQuality` preset into the H.264 codec defaults. PJSIP reads them when
+    /// a video stream's codec is opened, so this affects calls started afterwards, not an
+    /// already-open encoder.
+    func applyVideoQuality(_ quality: VideoQuality, orientation: VideoOrientation) {
         // `pjsua_vid_codec_set_param` clones the fmtp strings into the codec manager.
         var owned = OwnedCStrings()
         defer { owned.free() }
@@ -163,7 +166,7 @@ struct SipEndpointConfigurator {
         var param = pjmedia_vid_codec_param()
 
         guard pjsua_vid_codec_get_param(&codecId, &param) == PJ_SUCCESS.rawValue else {
-            logger.warning("setupVideoCodec: failed to get H264 codec param")
+            logger.warning("applyVideoQuality: failed to get H264 codec param")
             return
         }
 
@@ -172,28 +175,37 @@ struct SipEndpointConfigurator {
         param.dec_fmtp = buildFmtp(Self.h264FmtpParams, owned: &owned)
         param.enc_fmtp = buildFmtp(Self.h264FmtpParams, owned: &owned)
 
-        param.dec_fmt.det.vid.size.w = w
-        param.dec_fmt.det.vid.size.h = h
-        param.dec_fmt.det.vid.fps.num = 20
+        // The decoder buffer must fit any remote resolution regardless of orientation or
+        // of our own encoding preset: a square of the largest supported dimension prevents
+        // "not enough buffer for decoded frame" when the remote sends another orientation
+        // or a larger size (e.g. a 720p landscape browser).
+        param.dec_fmt.det.vid.size.w = VideoQuality.maxDecodeDimension
+        param.dec_fmt.det.vid.size.h = VideoQuality.maxDecodeDimension
+        param.dec_fmt.det.vid.fps.num = quality.fps
         param.dec_fmt.det.vid.fps.denum = 1
 
-        param.enc_fmt.det.vid.size.w = 480
-        param.enc_fmt.det.vid.size.h = 640
-        param.enc_fmt.det.vid.fps.num = 20
+        // Portrait: height > width (9:16). Landscape: width > height (16:9).
+        let isLandscape = orientation == .landscapeLeft || orientation == .landscapeRight
+        let encW = isLandscape ? quality.longSide : quality.shortSide
+        let encH = isLandscape ? quality.shortSide : quality.longSide
+        param.enc_fmt.det.vid.size.w = encW
+        param.enc_fmt.det.vid.size.h = encH
+        param.enc_fmt.det.vid.fps.num = quality.fps
         param.enc_fmt.det.vid.fps.denum = 1
 
         // Without an explicit bitrate cap the encoder falls back to PJSIP's own default,
         // which can exceed what the network path can sustain and cause continuous
         // congestion-driven packet loss (seen as a steady stream of "Frame lost, recovered!"
-        // on the receiving end's jitter buffer, not a one-off burst). These values are a
-        // sane starting point for 480x640@15fps H.264 and may need tuning per deployment.
-        param.enc_fmt.det.vid.avg_bps = 300_000
-        param.enc_fmt.det.vid.max_bps = 800_000
+        // on the receiving end's jitter buffer, not a one-off burst).
+        param.enc_fmt.det.vid.avg_bps = quality.avgBitrate
+        param.enc_fmt.det.vid.max_bps = quality.maxBitrate
 
         let status = pjsua_vid_codec_set_param(&codecId, &param)
         if status != PJ_SUCCESS.rawValue {
-            logger.warning("setupVideoCodec: failed to set H264 codec param, status = \(status.description)")
+            logger.warning("applyVideoQuality: failed to set H264 codec param, status = \(status.description)")
+            return
         }
+        logger.debug("applyVideoQuality: \(quality) \(encW)x\(encH) @ \(quality.fps)fps (\(quality.avgBitrate / 1000)kbps avg, \(orientation))")
     }
 
 

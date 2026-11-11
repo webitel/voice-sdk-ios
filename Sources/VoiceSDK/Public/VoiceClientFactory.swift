@@ -48,7 +48,7 @@ public enum VoiceClientFactory {
             baseURL: normalizedBaseURL,
             clientToken: config.clientToken ?? "",
             authMethod: authMethod,
-            callSettings: CallSettings(),
+            callSettings: config.callSettings,
             deviceId: config.deviceId ?? deviceStorage.getDeviceId(),
             agent: systemDetails.userAgent,
             pinnedHashes: config.pinnedPublicKeys,
