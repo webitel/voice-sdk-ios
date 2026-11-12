@@ -34,6 +34,7 @@ final class SipManager {
         toNumber: String,
         toName: String? = nil,
         meetingId: String? = nil,
+        metadataHeader: String? = nil,
         type: CallType,
         orientation: VideoOrientation
     ) throws -> Int32 {
@@ -43,6 +44,7 @@ final class SipManager {
             toNumber: toNumber,
             toName: toName,
             meetingId: meetingId,
+            metadataHeader: metadataHeader,
             videoCount: isVideo ? 1 : 0,
             orientation: isVideo ? orientation : nil
         )
@@ -54,6 +56,7 @@ final class SipManager {
         toNumber: String,
         toName: String?,
         meetingId: String?,
+        metadataHeader: String?,
         videoCount: UInt32,
         orientation: VideoOrientation?
     ) throws -> Int32 {
@@ -98,6 +101,9 @@ final class SipManager {
 
         if let meetingId, !meetingId.isEmpty {
             addHeader(msgData, pool: pool, name: "X-Webitel-Meeting", value: meetingId)
+        }
+        if let metadataHeader {
+            addHeader(msgData, pool: pool, name: SipHeaders.metadata, value: metadataHeader)
         }
         addHeader(msgData, pool: pool, name: "X-FS-Support", value: "update_display,send_info")
 

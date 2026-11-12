@@ -111,10 +111,29 @@ final class VoiceManager: CallControlDelegate {
                 toNumber: options.toNumber,
                 toName: options.toName,
                 meetingId: options.meetingId,
+                metadataHeader: self.encodeMetadata(options.metadata),
                 type: options.type,
                 orientation: options.videoOrientation
             )
             self.registry.assignSipId(sipId, to: callId)
+        }
+    }
+
+
+    /// Values are never logged: they may contain personal data.
+    private func encodeMetadata(_ metadata: [String: String]) -> String? {
+        switch CallMetadataEncoder.encode(metadata) {
+            case .success(let header):
+                if let header {
+                    logger.debug("makeCall: metadata keys \(metadata.keys.sorted()), \(header.utf8.count) bytes")
+                }
+                return header
+            case .failure(.tooLarge(let bytes)):
+                logger.warning("makeCall: metadata is \(bytes) bytes, limit is \(CallOptions.maxMetadataBytes); not sent")
+                return nil
+            case .failure(.encodingFailed(let error)):
+                logger.warning("makeCall: failed to encode metadata: \(error); not sent")
+                return nil
         }
     }
 

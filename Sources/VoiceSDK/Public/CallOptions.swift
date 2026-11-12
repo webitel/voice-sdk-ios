@@ -42,17 +42,34 @@ public struct CallOptions {
     /// Ignored for audio-only calls.
     public var videoOrientation: VideoOrientation
 
+    /// Arbitrary key-value data attached to the outgoing call and delivered to the
+    /// server in the SIP INVITE (a single `X-Webitel-Metadata` header with compact JSON,
+    /// e.g. `{"lang":"uk","orderId":"12345"}`).
+    ///
+    /// Intended for small identifiers (order id, language, source screen) — NOT for
+    /// payloads: the whole INVITE (including SDP) must fit the transport, and on UDP a
+    /// large INVITE gets fragmented or dropped. The encoded JSON is limited to
+    /// `CallOptions.maxMetadataBytes`; if the limit is exceeded the metadata is NOT
+    /// sent (the call still proceeds) and a warning is logged. Empty keys are ignored.
+    /// Defaults to empty (no header is sent).
+    public var metadata: [String: String]
+
+    /// Maximum size, in bytes, of `metadata` encoded as JSON.
+    public static let maxMetadataBytes = 1024
+
     public init(
         type: CallType = .audio,
         toNumber: String = "service",
         toName: String? = nil,
         meetingId: String? = nil,
-        videoOrientation: VideoOrientation = .portrait
+        videoOrientation: VideoOrientation = .portrait,
+        metadata: [String: String] = [:]
     ) {
         self.type = type
         self.toNumber = toNumber
         self.toName = toName
         self.meetingId = meetingId
         self.videoOrientation = videoOrientation
+        self.metadata = metadata
     }
 }
